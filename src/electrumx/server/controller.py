@@ -13,6 +13,7 @@ from aiorpcx import _version as aiorpcx_version
 import electrumx
 from electrumx.lib.server_base import ServerBase
 from electrumx.lib.util import version_string, OldTaskGroup
+from electrumx.lib.tx import TxOutpoint
 from electrumx.server.db import DB
 from electrumx.server.mempool import MemPool, MemPoolAPI
 from electrumx.server.session import SessionManager
@@ -34,8 +35,8 @@ class Notifications:
     def __init__(self):
         self._touched_hashxs_mp = {}  # type: Dict[int, Set[bytes]]
         self._touched_hashxs_bp = {}  # type: Dict[int, Set[bytes]]
-        self._touched_outpoints_mp = {}  # type: Dict[int, Set[Tuple[bytes, int]]]
-        self._touched_outpoints_bp = {}  # type: Dict[int, Set[Tuple[bytes, int]]]
+        self._touched_outpoints_mp = {}  # type: Dict[int, Set[TxOutpoint]]
+        self._touched_outpoints_bp = {}  # type: Dict[int, Set[TxOutpoint]]
         self._highest_block = -1
 
     async def _maybe_notify(self):
@@ -75,7 +76,7 @@ class Notifications:
             self,
             *,
             touched_hashxs: Set[bytes],
-            touched_outpoints: Set[Tuple[bytes, int]],
+            touched_outpoints: Set[TxOutpoint],
             height: int,
     ):
         pass
@@ -93,7 +94,7 @@ class Notifications:
             self,
             *,
             touched_hashxs: Set[bytes],
-            touched_outpoints: Set[Tuple[bytes, int]],
+            touched_outpoints: Set[TxOutpoint],
             height: int,
     ):
         self._touched_hashxs_mp[height] = touched_hashxs
@@ -104,7 +105,7 @@ class Notifications:
             self,
             *,
             touched_hashxs: Set[bytes],
-            touched_outpoints: Set[Tuple[bytes, int]],
+            touched_outpoints: Set[TxOutpoint],
             height: int,
     ):
         self._touched_hashxs_bp[height] = touched_hashxs
@@ -150,6 +151,7 @@ class Controller(ServerBase):
             notifications.db_height = get_db_height
             notifications.db_height_changed = db.db_flushed_event.wait
             notifications.cached_height = daemon.cached_height
+            notifications.daemon_height_changed = daemon.height_changed.wait
             notifications.mempool_txids_hum = daemon.mempool_txids_hum
             notifications.raw_transactions = daemon.getrawtransactions
             notifications.lookup_utxos = db.lookup_utxos
@@ -186,7 +188,12 @@ class Controller(ServerBase):
                 await group.spawn(db.populate_header_merkle_cache())
                 await group.spawn(mempool.keep_synchronized(mempool_event))
 
-            async with OldTaskGroup() as group:
-                await group.spawn(session_mgr.serve(notifications, mempool_event))
-                await group.spawn(bp.fetch_and_process_blocks(caught_up_event))
-                await group.spawn(wait_for_catchup())
+            try:
+                async with OldTaskGroup() as group:
+                    await group.spawn(session_mgr.serve(notifications, mempool_event))
+                    await group.spawn(bp.fetch_and_process_blocks(caught_up_event))
+                    await group.spawn(wait_for_catchup())
+            except Exception as e:
+                self.logger.exception("taskgroup died.")
+            finally:
+                self.logger.info("taskgroup stopped.")

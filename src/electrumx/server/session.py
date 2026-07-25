@@ -25,6 +25,7 @@ from typing import Iterable, Optional, TYPE_CHECKING, Sequence, Union, Any, Tupl
 from typing import Callable
 import random
 import inspect
+import logging
 
 import aiorpcx
 from aiorpcx import (Event, JSONRPCAutoDetect, JSONRPCConnection,
@@ -37,12 +38,12 @@ from aiorpcx.jsonrpc import SingleRequest
 import electrumx
 import electrumx.lib.util as util
 from electrumx.lib.lrucache import LRUCache
-from electrumx.lib.util import OldTaskGroup, is_hex_str
+from electrumx.lib.util import OldTaskGroup, is_hex_str, get_running_loop
 from electrumx.lib.hash import (HASHX_LEN, Base58Error, hash_to_hex_str,
                                 hex_str_to_hash, sha256, double_sha256)
 from electrumx.lib.merkle import MerkleCache
 from electrumx.lib.text import sessions_lines
-from electrumx.lib.tx import TXOSpendStatus
+from electrumx.lib.tx import TXOSpendStatus, TxOutpoint
 from electrumx.server.daemon import DaemonError
 from electrumx.server.transport import PaddedRSTransport
 
@@ -160,30 +161,56 @@ def retry_on_chain_sync_error(func=None, *, check_chaintip: bool):
     @functools.wraps(func)
     async def handle_chain_sync_error(self: 'ElectrumX', *args, **kw_args):
         session_mgr = self.session_mgr
-        sleeps = [0, 0.5, 2.5, 5, 10]
+        # note: the last sleep is ~infinite.  A timeout from env.request_timeout will trigger instead.
+        sleeps = [0, 0.5, 2.5, 5, 10, 10**6]  # seconds
+        t0 = time.monotonic()
         for attempt, sleep_time in enumerate(sleeps):
             if sleep_time != 0:
-                # A previous attempt failed. Sleep a bit before retrying. If the height changes, try again right away.
+                # A previous attempt failed. Sleep until the height changes.
+                # (This is a bit racy: we might miss the height changing if it changes before we start
+                #  awaiting the event. So we cap the sleep to sleep_time, and then retry anyway.)
                 async with ignore_after(sleep_time):
                     await session_mgr.notified_height_changed.wait()
             chaintip1 = chaintip2 = None
+            reorgcnt1 = reorgcnt2 = None
             try:
                 if check_chaintip:
                     chaintip1 = session_mgr.get_block_ref_for_chaintip()
+                    reorgcnt1 = session_mgr._reorg_count
                 res = await func(self, *args, **kw_args)
                 if check_chaintip:
                     chaintip2 = session_mgr.get_block_ref_for_chaintip()
-                if chaintip1 != chaintip2:
+                    reorgcnt2 = session_mgr._reorg_count
+                if not (chaintip1 == chaintip2 and reorgcnt1 == reorgcnt2):
                     raise ChainSyncError(message="chaintip moved while processing request")
             except ChainSyncError as e:
                 self.bump_cost(0.1)  # paranoia: maybe client can force ChainSyncError due to logic bug
-                self.logger.debug(f"got {e!r} while processing request: {func}. retrying ({attempt=}).")
+                time_elapsed = time.monotonic() - t0
+                if time_elapsed > 10.0:
+                    self.logger.debug(
+                        f"got {e!r} while processing request: {func}. retrying ({attempt=}). "
+                        f"time taken: {time_elapsed:.4f} sec")
                 continue  # try again
             assert chaintip1 == chaintip2
+            # success!  sending response now.
+            if attempt != 0:
+                time_elapsed = time.monotonic() - t0
+                self.logger.log(
+                    logging.INFO if time_elapsed > 5.0 else logging.DEBUG,
+                    f"responding to request after ChainSyncError, ({attempt=}): "
+                    f"{func}. time taken: {time_elapsed:.4f} sec")
             return res
+        # exhausted all attempts.  sending error.
+        # note: we should only get here if notified_height_changed at least once while processing the request,
+        #       and we got a ChainSyncError both when trying before and when trying after that.
+        #       That likely means the chaintip moved at least twice.
+        time_elapsed = time.monotonic() - t0
+        self.logger.info(
+            f"sending RPCError to client after exhausting all attempts for ChainSyncError. "
+            f"{func}. time taken: {time_elapsed:.4f} sec")
         raise RPCError(
             BAD_REQUEST,
-            "chaintip moved too many times (or DB not in sync with daemon) while processing request")
+            "chaintip moved too many times, or DB not in sync with daemon, while processing request")
     return handle_chain_sync_error
 
 
@@ -191,11 +218,6 @@ def retry_on_chain_sync_error(func=None, *, check_chaintip: bool):
 class BlockRef:
     height: int
     hash_rev: bytes
-
-    def to_protocol_json(self) -> tuple[int, str]:
-        hash_hum = hash_to_hex_str(self.hash_rev)
-        compressed_hash_hum = hash_hum.lstrip("0")
-        return self.height, compressed_hash_hum
 
 
 @dataclass(slots=True)
@@ -260,8 +282,9 @@ class SessionManager:
             tuple[int, str | None],
             tuple[bytes | None, float | None, asyncio.Lock]
         ] = LRUCache(maxsize=1000)
-        self.oc_txo_status_cache = LRUCache(maxsize=1000)  # type: LRUCache[tuple[bytes, int], TXOSpendStatus]
+        self.oc_txo_status_cache = LRUCache(maxsize=1000)  # type: LRUCache[TxOutpoint, TXOSpendStatus]
         self.notified_height = None  # type: int | None
+        self.notified_tip = None  # type: bytes | None  # block_hash_rev
         self.notified_height_changed = asyncio.Event()
         self.hsub_results = None  # type: dict[str, Any] | None
         self._task_group = OldTaskGroup()
@@ -279,7 +302,7 @@ class SessionManager:
 
     def _ssl_context(self) -> ssl.SSLContext:
         if self._sslc is None:
-            self._sslc = ssl.SSLContext(ssl.PROTOCOL_TLS)
+            self._sslc = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             self._sslc.load_cert_chain(self.env.ssl_certfile, keyfile=self.env.ssl_keyfile)
         return self._sslc
 
@@ -516,9 +539,10 @@ class SessionManager:
         '''
         # Paranoia: a reorg could race and leave db_height lower
         height = min(height, self.db.db_height)
-        raw = await self.raw_header(height)
-        self.hsub_results = {'hex': raw.hex(), 'height': height}
+        raw_header = await self.raw_header(height)
+        self.hsub_results = {'hex': raw_header.hex(), 'height': height}
         self.notified_height = height
+        self.notified_tip = self.env.coin.header_hash_rev(raw_header)
         self.notified_height_changed.set()
         self.notified_height_changed.clear()
         self.logger.debug(f"new notified_height: {self.notified_height}")
@@ -850,6 +874,7 @@ class SessionManager:
                 self.logger.warning('timed out waiting for server resources to close')
             servers_to_remove = list(self.servers.keys())
             self._remove_servers(servers_to_remove)
+            self.logger.info(f"all servers closed")
 
     def extra_cost(self, session: 'SessionBase') -> float:
         # Note there is no guarantee that session is still in self.sessions.  Example traceback:
@@ -862,24 +887,31 @@ class SessionManager:
 
     def get_block_ref_for_chaintip(self) -> BlockRef:
         """Returns a BlockRef for the current chaintip of the DB.
-        Raises ChainSyncError if the DB height is not up-to-date with the daemon height.
+        Raises ChainSyncError if the mempool is not up-to-date with the DB.
         """
-        daemon_height = self.daemon.cached_height()
+        # daemon_height = self.daemon.cached_height()
         bp_height = self.bp.height
+        bp_tip = self.bp.tip
         db_height = self.db.db_height
+        db_tip = self.db.db_tip
         notif_height = self.notified_height
-        # typical propagation: daemon_height -> bp_height -> db_height -> notified_height
-        # note: no need to compare tip hashes, heights are sufficient. A reorg would necessarily bump the height.
-        #       Well, except if multiple daemons are configured via DAEMON_URL, and they are on different sides
-        #       of a chainsplit, and we just switched between the daemons...
-        if not (daemon_height == bp_height == db_height == notif_height):
-            raise ChainSyncError(message="DB is lagging behind daemon")
+        notif_tip = self.notified_tip
+        # example propagation: daemon_height --(10s)-> bp_height --(0.1s)-> db_height --(1s)-> notified_height
+        # note: we only care about internal consistency: we allow daemon_height to differ. This also
+        #       significantly reduces the size of the critical time window.
+        #       We try to give the illusion of a consistent monolithic information-source to the client.
+        #       Most protocol method handlers only use e-x's db and mempool to resolve requests,
+        #       the few that also query bitcoind need to implement their own logic to make sure
+        #       the state they present is consistent with e-x's current db state.
+        if not (bp_height == db_height == notif_height):
+            raise ChainSyncError(message="DB/mempool still catching up with each other")
+        if not (bp_tip == db_tip == notif_tip):
+            raise ChainSyncError(message="DB/mempool still catching up with each other")
         assert db_height >= 0
-        tip_hash = self.db.db_tip
-        assert tip_hash is not None
+        assert db_tip is not None
         return BlockRef(
             height=db_height,
-            hash_rev=tip_hash,
+            hash_rev=db_tip,
         )
 
     async def _merkle_branch(
@@ -998,7 +1030,7 @@ class SessionManager:
         History is a sorted list of (txid_rev, height) tuples, or an RPCError.'''
         # History DoS limit.  Each element of history is about 99 bytes when encoded
         # as JSON.
-        max_byte_size_of_history_list = self.env.max_send - 100  # deduct a bit for overhead ("chaintip" in proto 1.7, etc)
+        max_byte_size_of_history_list = self.env.max_send - 100  # deduct a bit for overhead
         limit = max_byte_size_of_history_list // 99
         assert limit > 0
         cost = 0.1
@@ -1024,7 +1056,7 @@ class SessionManager:
             self,
             *,
             touched_hashxs: Set[bytes],
-            touched_outpoints: Set[Tuple[bytes, int]],
+            touched_outpoints: Set[TxOutpoint],
             height: int,
     ) -> None:
         '''Notify sessions about height changes and touched addresses.'''
@@ -1208,7 +1240,7 @@ class SessionBase(RPCSessionWithTaskGroup):
             self,
             *,
             touched_hashxs: Set[bytes],
-            touched_outpoints: Set[Tuple[bytes, int]],
+            touched_outpoints: Set[TxOutpoint],
             height_changed: bool,
     ) -> None:
         pass
@@ -1305,16 +1337,16 @@ class ElectrumX(SessionBase):
 
     PROTOCOL_MIN = (1, 4)
     # consider bumping Coin.MIN_REQUIRED_DAEMON_VERSION too when releasing a new protocol version
-    PROTOCOL_MAX = (1, 6, 0)
+    PROTOCOL_MAX = (1, 7, 0)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.subscribe_headers = False
         self.connection.max_response_size = self.env.max_send
         self.hashX_subs = {}  # type: Dict[bytes, str]  # hashX -> scripthash
-        self.txoutpoint_subs = set()  # type: Set[Tuple[bytes, int]]  # (txid_rev, txout_idx)
+        self.txoutpoint_subs = set()  # type: Set[TxOutpoint]  # (txid_rev, txout_idx)
         self.mempool_hashX_statuses = {}  # type: Dict[bytes, str]
-        self.mempool_txoutpoint_statuses = {}  # type: Dict[Tuple[bytes, int], TXOSpendStatus]
+        self.mempool_txoutpoint_statuses = {}  # type: Dict[TxOutpoint, TXOSpendStatus]
         self.set_request_handlers(self.PROTOCOL_MIN)
         self.is_peer = False
         self.cost = 5.0   # Connection cost
@@ -1385,7 +1417,7 @@ class ElectrumX(SessionBase):
             self,
             *,
             touched_hashxs: Set[bytes],
-            touched_outpoints: Set[Tuple[bytes, int]],
+            touched_outpoints: Set[TxOutpoint],
             height_changed: bool,
     ):
         """Send notifications.
@@ -1417,7 +1449,7 @@ class ElectrumX(SessionBase):
             self,
             *,
             touched_hashxs: Set[bytes],
-            touched_outpoints: Set[Tuple[bytes, int]],
+            touched_outpoints: Set[TxOutpoint],
             height_changed: bool,
     ) -> None:
         '''Notify the client about changes to touched addresses (from mempool
@@ -1466,14 +1498,16 @@ class ElectrumX(SessionBase):
         touched_outpoints = touched_outpoints.intersection(self.txoutpoint_subs)
         if touched_outpoints or (height_changed and self.mempool_txoutpoint_statuses):
             method = 'blockchain.outpoint.subscribe'
-            txo_to_status = {}  # type: dict[tuple[bytes, int], TXOSpendStatus]
+            txo_to_status = {}  # type: dict[TxOutpoint, TXOSpendStatus]
             for prevout in touched_outpoints:
+                # TODO taskgroup?
                 txo_to_status[prevout] = await self.txoutpoint_status_for_notif(*prevout)  # can raise RPCError
 
             # Check mempool TXOs - the status is a function of the confirmed state of
             # other transactions. (this is to detect if height changed from -1 to 0)
             mempool_txoutpoint_statuses = self.mempool_txoutpoint_statuses.copy()
             for prevout, old_status in mempool_txoutpoint_statuses.items():
+                # TODO taskgroup?
                 status = await self.txoutpoint_status_for_notif(*prevout)  # can raise RPCError
                 if status != old_status:
                     txo_to_status[prevout] = status
@@ -1596,6 +1630,9 @@ class ElectrumX(SessionBase):
         funder_bhash = funder_item.get("blockhash")
         funder_bheight = None  # type: Optional[int]
         if funder_bhash is not None:
+            # If the daemon's height is higher than our db.db_height, or the daemon *just* reorged,
+            # the db might fail to map this block_hash to a height: that's good for internal consistency.
+            # If our db has not caught up to a change yet, that change should be hidden from clients.
             funder_bheight = self.db.get_blockheight_from_blockhash(funder_bhash)
         if funder_bheight is None:  # if in mempool, will defer to mempool.spender_for_txo
             return TXOSpendStatus(funder_height=None)  # utxo never existed (in chain)
@@ -1717,6 +1754,7 @@ class ElectrumX(SessionBase):
         self.bump_cost(1.0 + len(utxos) / 50)
         return {'confirmed': confirmed, 'unconfirmed': unconfirmed}
 
+    @retry_on_chain_sync_error(check_chaintip=True)
     async def phandle_scripthash_get_balance(self, scripthash: str | Any) -> dict[str, Any]:
         '''Return the confirmed and unconfirmed balance of a scripthash.'''
         hashX = scripthash_to_hashX(scripthash)
@@ -1740,27 +1778,35 @@ class ElectrumX(SessionBase):
                 for txid_rev, height in history]
         unconf = await self.unconfirmed_history(hashX)
         # note: the same tx could appear both in conf and unconf, if it was *just* mined.
-        #       For protocol 1.7, this race is eliminated due to @retry_on_chain_sync_error(check_chaintip=True),
-        #       which ensures (self.notified_height == db.db_height).
-        #       Even for older protocol, _history_cache makes this race extremely unlikely: it could only happen
+        #       - more complicated example: tx1 could have been just mined, while
+        #         our not-caught-up-mempool still contains a conflicting tx2.
+        #         we should avoid sending an inconsistent response...
+        #       _history_cache makes this race unlikely: it could only happen
         #       if we *also* get a cache-miss (but the cache is only cleared when notified_height is updated).
+        #       Conceptually the same issue affects other methods too, e.g. get_balance:
+        #       in general the DB and the mempool might be out-of-sync with each other.
+        #       This issue is eliminated if the caller is wrapped in @retry_on_chain_sync_error(check_chaintip=True).
         return conf + unconf
 
+    @retry_on_chain_sync_error(check_chaintip=True)
     async def phandle_scripthash_get_history(self, scripthash: str | Any) -> list[dict[str, Any]]:
         '''Return the confirmed and unconfirmed history of a scripthash.'''
         hashX = scripthash_to_hashX(scripthash)
         return await self.confirmed_and_unconfirmed_history(hashX)
 
+    @retry_on_chain_sync_error(check_chaintip=True)
     async def phandle_scripthash_get_mempool(self, scripthash: str | Any) -> list[dict[str, Any]]:
         '''Return the mempool transactions touching a scripthash.'''
         hashX = scripthash_to_hashX(scripthash)
         return await self.unconfirmed_history(hashX)
 
+    @retry_on_chain_sync_error(check_chaintip=True)
     async def phandle_scripthash_listunspent(self, scripthash: str | Any) -> Sequence[dict[str, Any]]:
         '''Return the list of UTXOs of a scripthash.'''
         hashX = scripthash_to_hashX(scripthash)
         return await self.hashX_listunspent(hashX)
 
+    @retry_on_chain_sync_error(check_chaintip=True)
     async def phandle_scripthash_subscribe(self, scripthash: str | Any) -> Optional[str]:
         '''Subscribe to a script hash.
 
@@ -1779,7 +1825,6 @@ class ElectrumX(SessionBase):
         scripthash = spk_to_scripthash(spk)
         hashX = scripthash_to_hashX(scripthash)
         d = await self.get_balance(hashX)
-        d["chaintip"] = self.session_mgr.get_block_ref_for_chaintip().to_protocol_json()
         return d
 
     @retry_on_chain_sync_error(check_chaintip=True)
@@ -1788,7 +1833,6 @@ class ElectrumX(SessionBase):
         hashX = scripthash_to_hashX(scripthash)
         d = dict()
         d["history"] = await self.confirmed_and_unconfirmed_history(hashX)
-        d["chaintip"] = self.session_mgr.get_block_ref_for_chaintip().to_protocol_json()
         return d
 
     @retry_on_chain_sync_error(check_chaintip=True)
@@ -1797,7 +1841,6 @@ class ElectrumX(SessionBase):
         hashX = scripthash_to_hashX(scripthash)
         d = dict()
         d["history"] = await self.unconfirmed_history(hashX)
-        d["chaintip"] = self.session_mgr.get_block_ref_for_chaintip().to_protocol_json()
         return d
 
     @retry_on_chain_sync_error(check_chaintip=True)
@@ -1806,12 +1849,12 @@ class ElectrumX(SessionBase):
         hashX = scripthash_to_hashX(scripthash)
         d = dict()
         d["utxos"] = await self.hashX_listunspent(hashX)
-        d["chaintip"] = self.session_mgr.get_block_ref_for_chaintip().to_protocol_json()
         return d
 
-    def phandle_scriptpubkey_subscribe(self, spk: str) -> collections.abc.Awaitable[Optional[str]]:
+    @retry_on_chain_sync_error(check_chaintip=True)
+    async def phandle_scriptpubkey_subscribe(self, spk: str) -> Optional[str]:
         scripthash = spk_to_scripthash(spk)
-        return self.phandle_scripthash_subscribe(scripthash)
+        return await self.phandle_scripthash_subscribe(scripthash)
 
     def phandle_scriptpubkey_unsubscribe(self, spk: str) -> collections.abc.Awaitable[bool]:
         scripthash = spk_to_scripthash(spk)
@@ -1833,7 +1876,6 @@ class ElectrumX(SessionBase):
         if max(spend_status.funder_height or 0, spend_status.spender_height or 0) > db_chaintip.height:
             raise ChainSyncError(message="DB is lagging behind daemon")
         d = self._convert_txospendstatus_to_protocol_dict(spend_status)
-        d["chaintip"] = db_chaintip.to_protocol_json()
         return d
 
     @retry_on_chain_sync_error(check_chaintip=True)
@@ -1855,7 +1897,6 @@ class ElectrumX(SessionBase):
         # sub to outpoint
         self.txoutpoint_subs.add((txid_rev, txout_idx))
         d = self._convert_txospendstatus_to_protocol_dict(spend_status)
-        d["chaintip"] = db_chaintip.to_protocol_json()
         return d
 
     async def phandle_txoutpoint_unsubscribe(self, tx_hash: str | Any, txout_idx: int | Any) -> bool:
@@ -2363,7 +2404,6 @@ class ElectrumX(SessionBase):
         else:
             handlers['blockchain.relayfee'] = self.phandle_relayfee  # removed in 1.6
 
-        # experimental:
         if ptuple >= (1, 7):
             handlers['blockchain.transaction.testmempoolaccept'] = self.phandle_transaction_testmempoolaccept
             handlers['blockchain.outpoint.subscribe'] = self.phandle_txoutpoint_subscribe
@@ -2390,6 +2430,7 @@ class LocalRPC(SessionBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.sv_seen = True
+        assert get_running_loop() is not None, "must be running on asyncio thread"
         self.sv_negotiated.set()
         self.client_longname = 'RPC'
         self.connection.max_response_size = 0

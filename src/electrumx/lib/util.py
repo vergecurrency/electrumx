@@ -35,22 +35,24 @@ import logging
 import sys
 from collections.abc import Container, Mapping
 from struct import Struct
-from typing import Set, Any
+import time
+from typing import Any, Optional
 
 import aiorpcx
 
 
-# Use system-compiled JSON lib if available, fallback to stdlib
+# Use orjson (faster 3rd party library) if available, fallback to stdlib
 try:
-    import rapidjson as json
-except ImportError:
-    try:
-        import ujson as json
-    except ImportError:
-        import json
+    import orjson
+    json_deserialize = orjson.loads
 
-json_deserialize = json.loads
-json_serialize = json.dumps
+    def json_serialize(obj: Any) -> str:
+        return orjson.dumps(obj).decode()  # orjson.dumps() returns bytes
+except ImportError:
+    import json
+    json_deserialize = json.loads
+    json_serialize = json.dumps
+
 
 # Logging utilities
 
@@ -81,20 +83,6 @@ def make_logger(name, *, handler, level):
 def class_logger(path, classname):
     '''Return a hierarchical logger for a class.'''
     return logging.getLogger(path).getChild(classname)
-
-
-# Method decorator.  To be used for calculations that will always
-# deliver the same result.  The method cannot take any arguments
-# and should be accessed as an attribute.
-class cachedproperty:
-    def __init__(self, f):
-        self.f = f
-
-    def __get__(self, obj, type):
-        obj = obj or type
-        value = self.f(obj)
-        setattr(obj, self.f.__name__, value)
-        return value
 
 
 def formatted_time(t, sep=' '):
@@ -451,3 +439,30 @@ _aiorpcx_orig_unset_task_deadline = aiorpcx.curio._unset_task_deadline
 aiorpcx.curio._set_new_deadline = _aiorpcx_monkeypatched_set_new_deadline
 aiorpcx.curio._set_task_deadline = _aiorpcx_monkeypatched_set_task_deadline
 aiorpcx.curio._unset_task_deadline = _aiorpcx_monkeypatched_unset_task_deadline
+
+
+def get_running_loop() -> Optional[asyncio.AbstractEventLoop]:
+    """Returns the asyncio event loop that is *running in this thread*, if any."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+
+class LogTimeTaken:
+    """A simple context manager that logs how much time passed between enter and exit."""
+
+    def __init__(self, logger: logging.Logger, base_str: str, *, enabled: bool = True):
+        self.logger = logger
+        self.base_str = base_str
+        self.enabled = enabled
+        self.start_time = 0
+
+    def __enter__(self):
+        self.start_time = time.monotonic()
+        return None
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        time_elapsed = time.monotonic() - self.start_time
+        if self.enabled:
+            self.logger.debug(f'{self.base_str} took {time_elapsed:.3f}s.')

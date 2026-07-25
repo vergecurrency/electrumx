@@ -51,6 +51,8 @@ class SkipTxDeserialize(Exception):
 
 
 # note: slotted dataclasses are a bit faster than namedtuples
+# note: frozen dataclasses are much slower than non-frozen
+#       ref https://rednafi.com/python/statically-enforcing-frozen-dataclasses/
 @dataclass(kw_only=True, slots=True)
 class Tx:
     '''Class representing a transaction.'''
@@ -121,6 +123,9 @@ class TXOSpendStatus:
 
     def __post_init__(self):
         assert (self.spender_txid_rev is not None) == (self.spender_height is not None), (self.spender_txid_rev, self.spender_height)
+
+
+TxOutpoint = tuple[bytes, int]  # (txid_rev, txout_idx)
 
 
 class Deserializer:

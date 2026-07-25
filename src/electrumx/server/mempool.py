@@ -11,27 +11,30 @@ import itertools
 import time
 from abc import ABC, abstractmethod
 import asyncio
-from asyncio import Lock
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Sequence, Tuple, TYPE_CHECKING, Type, Dict, Optional, Set, Iterable
 import math
+from graphlib import TopologicalSorter
 
 from aiorpcx import run_in_thread, sleep, ignore_after
 
 from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash
 from electrumx.lib.tx import SkipTxDeserialize
-from electrumx.lib.util import class_logger, chunks, OldTaskGroup
-from electrumx.lib.tx import TXOSpendStatus
+from electrumx.lib.util import class_logger, chunks, OldTaskGroup, LogTimeTaken
+from electrumx.lib.tx import TXOSpendStatus, TxOutpoint
 from electrumx.server.db import UTXO
 
 if TYPE_CHECKING:
     from electrumx.lib.coins import Coin
 
 
+DB_UTXO_MAP = dict[TxOutpoint, Optional[tuple[bytes, int]]]  # prevout->(hashX,value_in_sats)
+
+
 @dataclass(slots=True)
 class MemPoolTx:
-    prevouts: Sequence[tuple[bytes, int]]  # (txid_rev, txout_idx)
+    prevouts: Sequence[TxOutpoint]  # (txid_rev, txout_idx)
     # A pair is a (hashX, value) tuple
     in_pairs: Optional[Sequence[tuple[bytes, int]]]  # (hashX, value_in_sats)
     out_pairs: Sequence[tuple[bytes, int]]  # (hashX, value_in_sats)
@@ -72,6 +75,10 @@ class MemPoolAPI(ABC):
         '''
 
     @abstractmethod
+    async def daemon_height_changed(self) -> None:
+        '''Wait until bitcoind's height changes.'''
+
+    @abstractmethod
     def db_height(self) -> int:
         '''Return the height flushed to the on-disk DB.'''
 
@@ -92,7 +99,7 @@ class MemPoolAPI(ABC):
         txids_hum is an iterable of hexadecimal hash strings.'''
 
     @abstractmethod
-    async def lookup_utxos(self, prevouts: Sequence[Tuple[bytes, int]]) -> Sequence[Optional[Tuple[bytes, int]]]:
+    async def lookup_utxos(self, prevouts: Sequence[TxOutpoint]) -> Sequence[Optional[Tuple[bytes, int]]]:
         '''Return a list of (hashX, value) pairs, one for each prevout if unspent,
         otherwise return None if spent or not found (for the given prevout).
 
@@ -104,7 +111,7 @@ class MemPoolAPI(ABC):
             self,
             *,
             touched_hashxs: Set[bytes],
-            touched_outpoints: Set[Tuple[bytes, int]],
+            touched_outpoints: Set[TxOutpoint],
             height: int,
     ):
         '''Called each time the mempool is synchronized.  touched_hashxs and
@@ -142,12 +149,12 @@ class MemPool:
         self.logger = class_logger(__name__, self.__class__.__name__)
         self.txs = {}  # type: Dict[bytes, MemPoolTx]  # txid_rev->tx
         self.hashXs = defaultdict(set)  # type: Dict[Optional[bytes], Set[bytes]]  # hashX->txids_rev
-        self.txo_to_spender = {}  # type: Dict[Tuple[bytes, int], bytes]  # prevout->txid_rev
+        self.txo_to_spender = {}  # type: Dict[TxOutpoint, bytes]  # prevout->txid_rev
         self.cached_compact_histogram = []  # type: Sequence[tuple[float, int]]
         self.refresh_secs = refresh_secs
         self.log_status_secs = log_status_secs
         # Prevents mempool refreshes during fee histogram calculation
-        self.lock = Lock()
+        self.lock = asyncio.Lock()
 
     async def _logging(self, synchronized_event):
         '''Print regular logs of mempool stats.'''
@@ -176,6 +183,7 @@ class MemPool:
 
     def _update_histogram(self, bin_size):
         # Build a histogram by fee rate
+        t0 = time.monotonic()
         histogram = defaultdict(int)
         for tx in self.txs.values():
             fee_rate = tx.fee / tx.size
@@ -187,7 +195,7 @@ class MemPool:
             histogram[fee_rate] += tx.size
 
         compact = self._compress_histogram(histogram, bin_size=bin_size)
-        self.logger.info(f'compact fee histogram: {compact}')
+        self.logger.info(f'compact fee histogram: {compact}. took {time.monotonic() - t0:.3f}s.')
         self.cached_compact_histogram = compact
 
     @classmethod
@@ -232,11 +240,11 @@ class MemPool:
             self,
             *,
             tx_map: Dict[bytes, MemPoolTx],  # txid_rev->tx
-            utxo_map: Dict[Tuple[bytes, int], Tuple[bytes, int]],  # prevout->(hashX,value_in_sats)
+            utxo_map: DB_UTXO_MAP,  # prevout->(hashX,value_in_sats)
             touched_hashxs: Set[bytes],  # set of hashXs
-            touched_outpoints: Set[Tuple[bytes, int]],  # set of outpoints
-    ) -> Tuple[Dict[bytes, MemPoolTx],
-               Dict[Tuple[bytes, int], Tuple[bytes, int]]]:
+            touched_outpoints: Set[TxOutpoint],  # set of outpoints
+            topologically_sort: bool,
+    ) -> tuple[dict[bytes, MemPoolTx], DB_UTXO_MAP]:
         '''Accept transactions in tx_map to the mempool if all their inputs
         can be found in the existing mempool or a utxo_map from the
         DB.
@@ -247,15 +255,33 @@ class MemPool:
         txs = self.txs
         txo_to_spender = self.txo_to_spender
 
-        deferred = {}
+        if topologically_sort:
+            # Sort tx_map so that parent txs come first (in case of unconf chain).
+            # This is just an optimization so that fewer txs will get "deferred", leading to better perf.
+            # Dependencies outside tx_map (already in chainstate (utxo_map), or our mempool (self.txs),
+            # or MISSING) are ignored.
+            cand_to_parents = {
+                txid: {parent_txid for (parent_txid, txout_idx) in tx.prevouts
+                       if parent_txid in tx_map}
+                for (txid, tx) in tx_map.items()}
+            cand_txids = list(TopologicalSorter(cand_to_parents).static_order())
+            assert len(tx_map) == len(cand_to_parents) == len(cand_txids), \
+                f"{len(tx_map)=}, {len(cand_to_parents)=}, {len(cand_txids)=}"
+            del cand_to_parents
+        else:
+            cand_txids = tx_map.keys()
+
+        deferred = {}  # type: dict[bytes, MemPoolTx]
         unspent = set(utxo_map)
-        # Try to find all prevouts so we can accept the TX
-        for txid_rev, tx in tx_map.items():
+        # Try to find all prevouts so we can accept the candidate TXs from tx_map into our mempool
+        for txid_rev in cand_txids:
+            tx = tx_map[txid_rev]
             in_pairs = []
             try:
                 for prevout in tx.prevouts:
+                    # first, look for parent tx among confirmed UTXOs:
                     utxo = utxo_map.get(prevout)
-                    if not utxo:  # i.e. parent also unconfirmed
+                    if not utxo:  # second, look for parent tx in mempool
                         prev_hash, prev_index = prevout
                         # Raises KeyError if prev_hash is not in txs
                         utxo = txs[prev_hash].out_pairs[prev_index]
@@ -292,12 +318,20 @@ class MemPool:
         # call transfers ownership
         touched_hashxs = set()
         touched_outpoints = set()
+        prev_mempool_height = -1
         while True:
             height = self.api.cached_height()
-            txids_hum = await self.api.mempool_txids_hum()
-            if height != await self.api.height():
+            is_new_block = height != prev_mempool_height
+            with LogTimeTaken(self.logger, "getrawmempool RPC", enabled=is_new_block):
+                txids_hum = await self.api.mempool_txids_hum()
+            if height != await self.api.height():  # if height changed *again*, re-start
                 continue
-            txids_rev = {hex_str_to_hash(hh) for hh in txids_hum}
+            with LogTimeTaken(self.logger, "convert_txids", enabled=is_new_block):
+                txids_rev = await run_in_thread(lambda: {hex_str_to_hash(hh) for hh in txids_hum})
+            if self.api.db_height() < height:
+                # DB not yet caught up. give it some time...
+                async with ignore_after(self.refresh_secs):
+                    await self.api.db_height_changed()
             try:
                 async with self.lock:
                     await self._process_mempool(
@@ -305,6 +339,7 @@ class MemPool:
                         touched_hashxs=touched_hashxs,
                         touched_outpoints=touched_outpoints,
                         mempool_height=height,
+                        debug_logs=is_new_block,
                     )
             except DBSyncError:
                 # The UTXO DB is not at the same height as the
@@ -318,90 +353,115 @@ class MemPool:
                     touched_outpoints=touched_outpoints,
                     height=height,
                 )
+                prev_mempool_height = height
                 touched_hashxs = set()
                 touched_outpoints = set()
             # poll bitcoind's whole mempool every few seconds; or instantly after the DB height changes
             async with ignore_after(self.refresh_secs):
-                await self.api.db_height_changed()
+                async with OldTaskGroup(wait=any) as group:
+                    await group.spawn(self.api.db_height_changed())
+                    await group.spawn(self.api.daemon_height_changed())
 
     async def _process_mempool(
             self,
             *,
-            all_txids_rev: Set[bytes],  # set of txids_rev
+            all_txids_rev: Set[bytes],  # set of txids_rev  # complete view of daemon's mempool
             touched_hashxs: Set[bytes],  # set of hashXs
-            touched_outpoints: Set[Tuple[bytes, int]],  # set of outpoints
+            touched_outpoints: Set[TxOutpoint],  # set of outpoints
             mempool_height: int,
+            debug_logs: bool = False,
     ) -> None:
         # Re-sync with the new set of hashes
         txs = self.txs
         hashXs = self.hashXs
         txo_to_spender = self.txo_to_spender
 
-        if mempool_height != self.api.db_height():
+        if mempool_height != self.api.db_height():  # FIXME should compare blockhash
             raise DBSyncError
 
-        # First handle txs that have disappeared
-        for txid_rev in (set(txs) - all_txids_rev):
-            tx = txs.pop(txid_rev)
-            # hashXs
-            tx_hashXs = {hashX for hashX, value in tx.in_pairs}
-            tx_hashXs.update(hashX for hashX, value in tx.out_pairs)
-            for hashX in tx_hashXs:
-                hashXs[hashX].remove(txid_rev)
-                if not hashXs[hashX]:
-                    del hashXs[hashX]
-            touched_hashxs |= tx_hashXs
-            # outpoints
-            for prevout in tx.prevouts:
-                del txo_to_spender[prevout]
-                touched_outpoints.add(prevout)
-            for out_idx, out_pair in enumerate(tx.out_pairs):
-                touched_outpoints.add((txid_rev, out_idx))
+        # 1. Handle txs that have disappeared (evicted, just got mined, etc)
+        # TODO split disappeared txs workload into a threadpool, chunks of ~200 txs
+        def handle_disappeared_txs() -> None:
+            nonlocal touched_hashxs
+            for txid_rev in disappeared_hashes:
+                tx = txs.pop(txid_rev)
+                # hashXs
+                tx_hashXs = {hashX for hashX, value in tx.in_pairs}
+                tx_hashXs.update(hashX for hashX, value in tx.out_pairs)
+                for hashX in tx_hashXs:
+                    hashXs[hashX].remove(txid_rev)
+                    if not hashXs[hashX]:
+                        del hashXs[hashX]
+                touched_hashxs |= tx_hashXs
+                # outpoints
+                for prevout in tx.prevouts:
+                    del txo_to_spender[prevout]
+                    touched_outpoints.add(prevout)
+                for out_idx, out_pair in enumerate(tx.out_pairs):
+                    touched_outpoints.add((txid_rev, out_idx))
 
-        # Process new transactions
-        new_hashes = list(all_txids_rev.difference(txs))
+        with LogTimeTaken(self.logger, "_process_mempool() removing txs", enabled=debug_logs):
+            disappeared_hashes = await run_in_thread(lambda: set(txs) - all_txids_rev)
+            handle_disappeared_txs()
+
+        # 2. Process new transactions
+        t0 = time.monotonic()
+        new_hashes = await run_in_thread(lambda: list(all_txids_rev.difference(txs)))
         if new_hashes:
+            # 2.1. fetch raw txs from bitcoin daemon
             group = OldTaskGroup()
             for hashes in chunks(new_hashes, 200):
-                coro = self._fetch_and_accept(
+                coro = self._fetch_raw_txs_and_utxos(
                     new_txids_rev=hashes,
                     all_txids_rev=all_txids_rev,
-                    touched_hashxs=touched_hashxs,
-                    touched_outpoints=touched_outpoints,
                 )
                 await group.spawn(coro)
             if mempool_height != self.api.db_height():
                 raise DBSyncError
 
-            tx_map = {}
-            utxo_map = {}
+            tx_map = {}  # type: dict[bytes, MemPoolTx]
+            utxo_map = {}  # type: DB_UTXO_MAP
             async for task in group:
-                deferred, unspent = task.result()
-                tx_map.update(deferred)
-                utxo_map.update(unspent)
+                partial_tx_map, partial_utxo_map = task.result()
+                tx_map.update(partial_tx_map)
+                utxo_map.update(partial_utxo_map)
+            if debug_logs:
+                self.logger.debug(f'_process_mempool() fetching txs took {time.monotonic() - t0:.3f}s. {len(new_hashes)=}')
 
-            prior_count = 0
-            # FIXME: this is not particularly efficient
-            while tx_map and len(tx_map) != prior_count:
-                prior_count = len(tx_map)
-                tx_map, utxo_map = self._accept_transactions(
-                    tx_map=tx_map,
-                    utxo_map=utxo_map,
-                    touched_hashxs=touched_hashxs,
-                    touched_outpoints=touched_outpoints,
-                )
-            if tx_map:
-                self.logger.error(f'{len(tx_map)} txs dropped')
+            # 2.2. accept txs into our mempool
+            def accept_txs_loop() -> None:
+                # Accept candidate txs from tx_map into our mempool.
+                # We only accept candidates for which we can find a UTXO for each tx input:
+                # - some UTXOs we find in the DB=utxo_map (chainstate),
+                # - some we find in self.txs (our memool),
+                # - some we might only find in tx_map (among the candidates: consider long chain of unconfirmed txs)
+                # - some we might not find anywhere: if DB is corrupted or bitcoind gave inconsistent mempool, or other race
+                # In each iteration, we loop over tx_map and move accepted transactions from it to self.txs.
+                # In the worst degenerate case, this could be O(n^2). To avoid that, we topologically sort tx_map.
+                nonlocal tx_map, utxo_map
+                prior_txmap_size = 0
+                while tx_map and len(tx_map) != prior_txmap_size:
+                    prior_txmap_size = len(tx_map)
+                    tx_map, utxo_map = self._accept_transactions(
+                        tx_map=tx_map,
+                        utxo_map=utxo_map,
+                        touched_hashxs=touched_hashxs,
+                        touched_outpoints=touched_outpoints,
+                        topologically_sort=True,
+                    )
+                if tx_map:
+                    self.logger.error(f'{len(tx_map)} txs dropped')
 
-    async def _fetch_and_accept(
+            with LogTimeTaken(self.logger, f"_process_mempool() accepting txs ({len(new_hashes)=})", enabled=debug_logs):
+                accept_txs_loop()
+
+    async def _fetch_raw_txs_and_utxos(
             self,
             *,
-            new_txids_rev: Set[bytes],  # new txs being added to mempool
-            all_txids_rev: Set[bytes],  # existing txs in mempool
-            touched_hashxs: Set[bytes],  # set of hashXs
-            touched_outpoints: Set[Tuple[bytes, int]],  # set of outpoints
-    ):
-        '''Fetch a list of mempool transactions.'''
+            new_txids_rev: set[bytes],  # (some) new candidate txs for our mempool
+            all_txids_rev: set[bytes],  # complete view of daemon's mempool
+    ) -> tuple[dict[bytes, MemPoolTx], DB_UTXO_MAP]:
+        '''Fetch a list of mempool transactions, and lookup corresponding UTXOs in the DB.'''
         txids_hum_iter = (hash_to_hex_str(hash) for hash in new_txids_rev)
         raw_txs = await self.api.raw_transactions(txids_hum_iter)
 
@@ -451,12 +511,7 @@ class MemPool:
         utxos = await self.api.lookup_utxos(prevouts)
         utxo_map = {prevout: utxo for prevout, utxo in zip(prevouts, utxos)}
 
-        return self._accept_transactions(
-            tx_map=tx_map,
-            utxo_map=utxo_map,
-            touched_hashxs=touched_hashxs,
-            touched_outpoints=touched_outpoints,
-        )
+        return tx_map, utxo_map
 
     #
     # External interface
@@ -486,7 +541,7 @@ class MemPool:
         '''Return a compact fee histogram of the current mempool.'''
         return self.cached_compact_histogram
 
-    async def potential_spends(self, hashX: bytes) -> set[tuple[bytes, int]]:
+    async def potential_spends(self, hashX: bytes) -> set[TxOutpoint]:
         '''Return a set of (prev_hash, prev_idx) pairs from mempool
         transactions that touch hashX.
 

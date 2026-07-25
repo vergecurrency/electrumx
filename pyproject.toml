@@ -22,7 +22,12 @@ classifiers = [
     "Framework :: AsyncIO",
     "Natural Language :: English",
     "Operating System :: Unix",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Database",
     "Topic :: Internet",
 ]
@@ -51,11 +56,8 @@ rocksdb = [
 dev = [
     "objgraph",
 ]
-rapidjson = [
-    "python-rapidjson>=0.4.1,<2.0",
-]
-ujson = [
-    "ujson>=2.0.0,<4.0.0",
+orjson = [
+    "orjson>=3,<4",
 ]
 uvloop = [
     "uvloop>=0.14",
