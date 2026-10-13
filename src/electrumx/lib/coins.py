@@ -708,11 +708,28 @@ class Verge(Coin):
     TX_COUNT = 500000
     TX_COUNT_HEIGHT = 3082138
     TX_PER_BLOCK = 1
+    STATIC_BLOCK_HEADERS = False
     DESERIALIZER = lib_tx.DeserializerVerge
+
+    POS_VERSION_BIT = 1 << 15
+    POS_HEADER_SIZE = 112
+
+    @classmethod
+    def block_header(cls, block, height):
+        '''Return an 80-byte PoW header or a 112-byte PoS header.'''
+        version, = struct.unpack_from('<I', block)
+        size = (cls.POS_HEADER_SIZE if version & cls.POS_VERSION_BIT
+                else cls.BASIC_HEADER_SIZE)
+        return block[:size]
 
     @classmethod
     def header_hash_rev(cls, header):
         '''Given a header return the hash.'''
+        version, = struct.unpack_from('<I', header)
+        if version & cls.POS_VERSION_BIT:
+            if len(header) != cls.POS_HEADER_SIZE:
+                raise ValueError('invalid Verge PoS header length')
+            return double_sha256(header)
         import scrypt
         return scrypt.hash(header, header, 1024, 1, 1, 32)
 

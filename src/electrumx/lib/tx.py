@@ -910,10 +910,17 @@ class DeserializerReddcoin(Deserializer):
 
 
 class DeserializerVerge(Deserializer):
+    POS_REPLAY_PROTECTED_VERSION = 0x05475658
+    POS_REPLAY_MARKER = 0x47565800
+
     def read_tx(self):
         start = self.cursor
         version = self._read_le_int32()
         time = self._read_le_uint32()
+        if version == self.POS_REPLAY_PROTECTED_VERSION:
+            marker = self._read_le_uint32()
+            if marker != self.POS_REPLAY_MARKER:
+                raise ValueError('invalid Verge PoS transaction replay marker')
         inputs = self._read_inputs()
         outputs = self._read_outputs()
         locktime = self._read_le_uint32()
